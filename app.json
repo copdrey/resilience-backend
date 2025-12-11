@@ -1,0 +1,67 @@
+{
+  "expo": {
+    "name": "Resilience",
+    "slug": "resilience-app",
+    "scheme": "resilience",
+    "owner": "copdrey",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+
+    "platforms": ["ios", "android", "web"],
+
+    "splash": {
+      "image": "./assets/a11.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+
+    "assetBundlePatterns": ["**/*"],
+
+    "ios": {
+      "bundleIdentifier": "com.resilience.app",
+      "supportsTablet": true,
+      "deploymentTarget": "15.1",
+      "infoPlist": {
+        "NSCameraUsageDescription": "L’app utilise la caméra pour certaines fonctionnalités.",
+        "NSPhotoLibraryUsageDescription": "L’app peut accéder à la photothèque pour importer des images."
+      }
+    },
+
+    "android": {
+      "package": "com.resilience.app",
+      "permissions": ["android.permission.CAMERA"],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      }
+    },
+
+    "web": {
+      "bundler": "metro",
+      "favicon": "./assets/favicon.png"
+    },
+
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "deploymentTarget": "15.1"
+          }
+        }
+      ],
+      [
+        "react-native-vision-camera",
+        {
+          "cameraPermissionText": "Autorisez l’accès à la caméra pour prendre des photos et vidéos."
+        }
+      ]
+    ],
+
+    "extra": {
+      "eas": { "projectId": "REPLACER-PLUS-TARD" }
+    }
+  }
+}
