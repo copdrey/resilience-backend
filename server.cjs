@@ -7,7 +7,7 @@ const { createClient } = require('@supabase/supabase-js');
 const {
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
-  PORT = 8787
+  PORT = 8080
 } = process.env;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -21,7 +21,7 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// 1) Checkout: on simule un paiement "ok" puis on écrit en base
+// 1) Checkout coaching
 app.post('/api/coaching/checkout', async (req, res) => {
   try {
     const { member_id, program_id } = req.body;
@@ -29,116 +29,177 @@ app.post('/api/coaching/checkout', async (req, res) => {
       return res.status(400).json({ error: 'member_id and program_id are required' });
     }
 
-    // Récupérer le programme (prix)
+    // ✅ Correction 1 : Bonne table + bon champ
     const { data: prog, error: pe } = await supabase
-      .from('coach_programs')
-      .select('id, price_cents, videos')
+      .from('coaching_programs')  // ✅ CHANGÉ
+      .select('id, price, title')  // ✅ CHANGÉ
       .eq('id', program_id)
       .single();
-    if (pe || !prog) return res.status(400).json({ error: pe?.message || 'Program not found' });
 
-    // (Ici tu appelles GoCardless/Stripe pour créer un paiement…)
-    // Pour l'instant, on suppose "paid" directement :
-
-    // 1° Créer l'achat
-    const { error: ip } = await supabase.from('purchases').insert({
-      member_id,
-      product_type: 'coaching_program',
-      quantity: 1,
-      amount_cents: prog.price_cents,
-      status: 'paid',
-    });
-    if (ip) return res.status(500).json({ error: ip.message });
-
-    // 2° Créer l'enrôlement si pas déjà présent
-    const { data: existing } = await supabase
-      .from('coach_enrollments')
-      .select('program_id')
-      .eq('program_id', program_id)
-      .eq('member_id', member_id)
-      .maybeSingle();
-
-    if (!existing) {
-      const { error: ie } = await supabase.from('coach_enrollments').insert({
-        program_id,
-        member_id,
-        progress: 0,
-        completed_sessions: 0,
-        total_sessions: prog.videos || 0,
-      });
-      if (ie) return res.status(500).json({ error: ie.message });
+    if (pe || !prog) {
+      return res.status(400).json({ error: pe?.message || 'Program not found' });
     }
 
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: String(e.message || e) });
-  }
-});
+    // ✅ Correction 2 : Créer redirect GoCardless
+    const amount = parseFloat(prog.price);
 
-// Route pour créer un redirect flow GoCardless (achats de crédits)
-app.post('/gc/redirect-flow', async (req, res) => {
-  try {
-    const { sessionToken, amount, description, metadata } = req.body;
+    // Récupérer infos user
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('full_name, email')
+      .eq('id', member_id)
+      .single();
 
-    if (!sessionToken || !amount || !description) {
-      return res.status(400).json({ error: 'Paramètres manquants' });
-    }
+    const sessionToken = `coaching_${member_id}_${Date.now()}`;
 
-    // Créer le redirect flow GoCardless
-    const redirectFlow = await fetch(`${process.env.GC_BASE}/redirect_flows`, {
+    const gcBody = {
+      redirect_flows: {
+        description: `Coaching ${prog.title}`,
+        session_token: sessionToken,
+        success_redirect_url: process.env.GC_SUCCESS_REDIRECT_URL || 'https://resilience-backend-production.up.railway.app/gc/success',
+        scheme: 'sepa_core',
+        prefilled_customer: {
+          given_name: profile?.full_name?.split(' ')[0] || 'Client',
+          family_name: profile?.full_name?.split(' ').slice(1).join(' ') || '',
+          email: profile?.email || '',
+        },
+        metadata: {
+          user_id: member_id,
+          program_id: String(program_id),
+          amount: String(amount),
+          product_type: 'coaching',
+        }
+      }
+    };
+
+    console.log('[Coaching] Creating GoCardless flow...');
+
+    const gcResponse = await fetch(`${process.env.GC_BASE || 'https://api.gocardless.com'}/redirect_flows`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${process.env.GC_ACCESS_TOKEN}`,
         'GoCardless-Version': '2015-07-06',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        redirect_flows: {
-          description: description,
-          session_token: sessionToken,
-          success_redirect_url: process.env.GC_SUCCESS_REDIRECT_URL || 'http://localhost:4000/gc/success',
-          prefilled_customer: {
-            given_name: metadata?.userName || '',
-            email: metadata?.userEmail || '',
-          },
-          metadata: {
-            ...metadata,
-            amount: amount.toString(),
-          },
-        },
-      }),
+      body: JSON.stringify(gcBody),
     });
 
-    const data = await redirectFlow.json();
+    const gcData = await gcResponse.json();
 
-    if (!redirectFlow.ok) {
+    if (!gcResponse.ok) {
+      console.error('[Coaching] GoCardless error:', gcData);
+      return res.status(500).json({ error: gcData.error?.message || 'Erreur GoCardless' });
+    }
+
+    console.log('[Coaching] Flow created:', gcData.redirect_flows.id);
+
+    // ✅ Correction 3 : Retourner redirectUrl
+    return res.json({
+      redirectUrl: gcData.redirect_flows.redirect_url,
+      flowId: gcData.redirect_flows.id,
+    });
+
+  } catch (e) {
+    console.error('[Coaching] Error:', e);
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// Route pour créer un redirect flow GoCardless
+app.post('/gc/redirect-flow', async (req, res) => {
+  try {
+    const { sessionToken, amount, description, metadata = {} } = req.body;
+
+    if (!sessionToken || !amount || !description) {
+      return res.status(400).json({ error: 'Paramètres manquants' });
+    }
+
+    const amountNum = parseFloat(amount);
+    if (isNaN(amountNum) || amountNum <= 0) {
+      return res.status(400).json({ error: 'Montant invalide' });
+    }
+
+    // Construire le body GoCardless
+    const gcBody = {
+      redirect_flows: {
+        description: String(description),
+        session_token: String(sessionToken),
+        success_redirect_url: process.env.GC_SUCCESS_REDIRECT_URL || 'https://resilience-backend-production.up.railway.app/gc/success',
+       scheme: 'sepa_core', // IMPORTANT pour UK/EU
+      }
+    };
+
+    // Ajouter prefilled_customer si on a les infos
+    if (metadata.userName || metadata.userEmail) {
+      const nameParts = metadata.userName ? String(metadata.userName).trim().split(' ') : ['Client'];
+
+      gcBody.redirect_flows.prefilled_customer = {
+        given_name: nameParts[0] || 'Client',
+      };
+
+      if (nameParts.length > 1) {
+        gcBody.redirect_flows.prefilled_customer.family_name = nameParts.slice(1).join(' ');
+      }
+
+      if (metadata.userEmail) {
+        gcBody.redirect_flows.prefilled_customer.email = String(metadata.userEmail);
+      }
+    }
+
+    // Ajouter metadata pour retrouver les infos après paiement
+    if (metadata.userId) {
+      gcBody.redirect_flows.metadata = {
+        user_id: String(metadata.userId),
+        credits: String(metadata.credits || '0'),
+        amount: String(amountNum),
+      };
+    }
+
+    console.log('[GC] Body envoyé:', JSON.stringify(gcBody, null, 2));
+
+    // Appel GoCardless
+    const gcResponse = await fetch(`${process.env.GC_BASE || 'https://api.gocardless.com'}/redirect_flows`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.GC_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(gcBody),
+    });
+
+    const data = await gcResponse.json();
+
+    if (!gcResponse.ok) {
+      console.error('[GC] Erreur GoCardless:', JSON.stringify(data, null, 2));
       throw new Error(data.error?.message || 'Erreur GoCardless');
     }
 
+    console.log('[GC] Flow créé:', data.redirect_flows.id);
+
     res.json({
       redirectUrl: data.redirect_flows.redirect_url,
-      sessionToken,
       flowId: data.redirect_flows.id,
     });
   } catch (error) {
-    console.error('[GC] Erreur redirect flow:', error);
+    console.error('[GC] Erreur:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Route callback GoCardless après paiement
+// Route callback GoCardless
 app.get('/gc/success', async (req, res) => {
   try {
-    const { redirect_flow_id } = req.query;
+    const { redirect_flow_id, session_token } = req.query;
+
+    console.log('[GC] Success callback:', { redirect_flow_id, session_token });
 
     if (!redirect_flow_id) {
       return res.status(400).send('Missing redirect_flow_id');
     }
 
-    // Compléter le redirect flow
     const completeFlow = await fetch(
-      `${process.env.GC_BASE}/redirect_flows/${redirect_flow_id}/actions/complete`,
+      `${process.env.GC_BASE || 'https://api.gocardless.com'}/redirect_flows/${redirect_flow_id}/actions/complete`,
       {
         method: 'POST',
         headers: {
@@ -148,7 +209,7 @@ app.get('/gc/success', async (req, res) => {
         },
         body: JSON.stringify({
           data: {
-            session_token: req.query.session_token,
+            session_token: session_token || '',
           },
         }),
       }
@@ -157,15 +218,23 @@ app.get('/gc/success', async (req, res) => {
     const flowData = await completeFlow.json();
 
     if (!completeFlow.ok) {
-      throw new Error('Erreur completion flow');
+      console.error('[GC] Error completing flow:', flowData);
+      throw new Error('Erreur completion flow: ' + JSON.stringify(flowData));
     }
 
-    const metadata = flowData.redirect_flows.metadata || {};
-    const userId = metadata.userId;
+    console.log('[GC] Flow completed:', flowData);
+
+    const metadata = flowData.redirect_flows?.metadata || {};
+    const userId = metadata.user_id;
     const credits = parseInt(metadata.credits || '0');
     const amount = parseFloat(metadata.amount || '0');
 
-    // Enregistrer l'achat dans credit_purchases
+    if (!userId) {
+      console.error('[GC] No userId in metadata');
+      return res.status(400).send('Missing userId in flow metadata');
+    }
+
+    // Enregistrer l'achat
     const { error: purchaseError } = await supabase
       .from('credit_purchases')
       .insert({
@@ -175,23 +244,27 @@ app.get('/gc/success', async (req, res) => {
         payment_status: 'completed',
         payment_method: 'gocardless',
         transaction_id: flowData.redirect_flows.id,
+        notes: `GoCardless payment - ${credits} crédits`,
       });
 
-    if (purchaseError) throw purchaseError;
+    if (purchaseError) {
+      console.error('[GC] Error creating purchase:', purchaseError);
+      throw purchaseError;
+    }
 
-    // Mettre à jour les crédits de l'utilisateur
+    // Mettre à jour les crédits
     const { data: currentCredits } = await supabase
       .from('user_credits')
       .select('credits_remaining, total_purchased')
       .eq('user_id', userId)
-      .single();
+      .maybeSingle();
 
     if (currentCredits) {
       await supabase
         .from('user_credits')
         .update({
-          credits_remaining: currentCredits.credits_remaining + credits,
-          total_purchased: currentCredits.total_purchased + credits,
+          credits_remaining: (currentCredits.credits_remaining || 0) + credits,
+          total_purchased: (currentCredits.total_purchased || 0) + credits,
         })
         .eq('user_id', userId);
     } else {
@@ -202,30 +275,78 @@ app.get('/gc/success', async (req, res) => {
       });
     }
 
-    // Rediriger vers l'app avec deep link
+    console.log('[GC] Credits updated for user:', userId);
+
     const appSuccessUrl = process.env.GC_APP_SUCCESS_URL || 'resilienceapp://gc/success';
     res.redirect(appSuccessUrl);
   } catch (error) {
     console.error('[GC] Erreur callback:', error);
-    res.status(500).send('Erreur lors du paiement');
+    res.status(500).send('Erreur lors du paiement: ' + error.message);
   }
 });
 
-// 2) Webhook PSP (exemple): tu recevras l'event 'payment.succeeded' ici
+// Webhook GoCardless
+app.post('/gc/webhook', async (req, res) => {
+  try {
+    const events = req.body.events || [];
+    console.log('[GC] Webhook received:', events.length, 'events');
+
+    for (const event of events) {
+      console.log('[GC] Processing event:', event.resource_type, event.action);
+
+      if (event.resource_type === 'payments' && event.action === 'confirmed') {
+        const paymentId = event.links.payment;
+
+        const paymentResponse = await fetch(
+          `${process.env.GC_BASE || 'https://api.gocardless.com'}/payments/${paymentId}`,
+          {
+            headers: {
+              'Authorization': `Bearer ${process.env.GC_ACCESS_TOKEN}`,
+              'GoCardless-Version': '2015-07-06',
+            },
+          }
+        );
+
+        const paymentData = await paymentResponse.json();
+        console.log('[GC] Payment data:', paymentData);
+
+        if (paymentData.payments?.metadata?.user_id) {
+          await supabase
+            .from('credit_purchases')
+            .update({ payment_status: 'completed' })
+            .eq('transaction_id', paymentId);
+        }
+      }
+
+      if (event.resource_type === 'payments' && event.action === 'failed') {
+        const paymentId = event.links.payment;
+        await supabase
+          .from('credit_purchases')
+          .update({ payment_status: 'failed' })
+          .eq('transaction_id', paymentId);
+        console.log('[GC] Payment failed:', paymentId);
+      }
+    }
+
+    res.status(200).json({ received: true });
+  } catch (error) {
+    console.error('[GC] Webhook error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Webhook PSP
 app.post('/api/webhooks/psp', async (req, res) => {
   try {
-    // TODO: vérifier la signature du PSP
     const { member_id, program_id, amount_cents, status } = req.body;
-
     if (status !== 'paid') return res.json({ ok: true });
 
-    // idem qu'au-dessus : insert purchase + enrollment
     await supabase.from('purchases').insert({
       member_id, product_type: 'coaching_program', quantity: 1, amount_cents, status: 'paid'
     });
 
     const { data: prog } = await supabase
-      .from('coach_programs')
+      .from('coaching_programs')
       .select('videos')
       .eq('id', program_id)
       .single();
@@ -251,7 +372,7 @@ app.post('/api/webhooks/psp', async (req, res) => {
   }
 });
 
-// Route pour réserver un cours
+// Route réservation cours
 app.post('/courses/:courseId/enroll', async (req, res) => {
   try {
     const { courseId } = req.params;
@@ -261,7 +382,6 @@ app.post('/courses/:courseId/enroll', async (req, res) => {
       return res.status(400).json({ error: 'userId requis' });
     }
 
-    // Vérifier les crédits
     const { data: credits, error: creditsError } = await supabase
       .from('user_credits')
       .select('credits_remaining')
@@ -272,7 +392,6 @@ app.post('/courses/:courseId/enroll', async (req, res) => {
       return res.status(400).json({ error: 'Crédits insuffisants' });
     }
 
-    // Créer la réservation
     const { data: reservation, error: reservationError } = await supabase
       .from('reservations')
       .insert({
@@ -286,7 +405,6 @@ app.post('/courses/:courseId/enroll', async (req, res) => {
 
     if (reservationError) throw reservationError;
 
-    // Déduire 1 crédit
     const { error: updateError } = await supabase
       .from('user_credits')
       .update({ credits_remaining: credits.credits_remaining - 1 })
@@ -302,6 +420,51 @@ app.post('/courses/:courseId/enroll', async (req, res) => {
   } catch (error) {
     console.error('[Enroll] Erreur:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Test Supabase
+app.get('/debug/supabase', async (req, res) => {
+  try {
+    const { count: userCount, error: userError } = await supabase
+      .from('profiles')
+      .select('*', { count: 'exact', head: true });
+
+    if (userError) throw userError;
+
+    const { count: courseCount, error: courseError } = await supabase
+      .from('course_templates')
+      .select('*', { count: 'exact', head: true });
+
+    if (courseError) throw courseError;
+
+    const { count: paymentCount, error: paymentError} = await supabase
+      .from('credit_purchases')
+      .select('*', { count: 'exact', head: true });
+
+    if (paymentError) throw paymentError;
+
+    res.json({
+      status: 'ok',
+      supabase: 'connected',
+      counts: {
+        users: userCount,
+        courses: courseCount,
+        payments: paymentCount,
+      },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      error: error.message,
+      timestamp: new Date().toISOString(),
+    });
   }
 });
 
