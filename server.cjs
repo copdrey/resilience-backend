@@ -21,7 +21,7 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// 1) Checkout coaching
+// ✅ 1) Checkout coaching - CORRIGÉ
 app.post('/api/coaching/checkout', async (req, res) => {
   try {
     const { member_id, program_id } = req.body;
@@ -29,19 +29,25 @@ app.post('/api/coaching/checkout', async (req, res) => {
       return res.status(400).json({ error: 'member_id and program_id are required' });
     }
 
-    // ✅ Correction 1 : Bonne table + bon champ
+    console.log('[Coaching] Checkout request:', { member_id, program_id });
+
+    // ✅ CORRECTION 1 : Bonne table + bons champs
     const { data: prog, error: pe } = await supabase
-      .from('coaching_programs')  // ✅ CHANGÉ
-      .select('id, price, title')  // ✅ CHANGÉ
+      .from('coaching_programs')  // ✅ Correct
+      .select('id, price, title')  // ✅ Correct
       .eq('id', program_id)
       .single();
 
     if (pe || !prog) {
+      console.error('[Coaching] Program not found:', pe);
       return res.status(400).json({ error: pe?.message || 'Program not found' });
     }
 
-    // ✅ Correction 2 : Créer redirect GoCardless
+    console.log('[Coaching] Program found:', prog.title, prog.price);
+
+    // ✅ CORRECTION 2 : Créer redirect GoCardless
     const amount = parseFloat(prog.price);
+    const amountPence = Math.round(amount * 100);  // Convertir en centimes
 
     // Récupérer infos user
     const { data: profile } = await supabase
@@ -49,6 +55,8 @@ app.post('/api/coaching/checkout', async (req, res) => {
       .select('full_name, email')
       .eq('id', member_id)
       .single();
+
+    console.log('[Coaching] User profile:', profile?.email);
 
     const sessionToken = `coaching_${member_id}_${Date.now()}`;
 
@@ -67,6 +75,7 @@ app.post('/api/coaching/checkout', async (req, res) => {
           user_id: member_id,
           program_id: String(program_id),
           amount: String(amount),
+          amount_pence: String(amountPence),  // ✅ En centimes
           product_type: 'coaching',
         }
       }
@@ -87,13 +96,13 @@ app.post('/api/coaching/checkout', async (req, res) => {
     const gcData = await gcResponse.json();
 
     if (!gcResponse.ok) {
-      console.error('[Coaching] GoCardless error:', gcData);
+      console.error('[Coaching] GoCardless error:', JSON.stringify(gcData, null, 2));
       return res.status(500).json({ error: gcData.error?.message || 'Erreur GoCardless' });
     }
 
     console.log('[Coaching] Flow created:', gcData.redirect_flows.id);
 
-    // ✅ Correction 3 : Retourner redirectUrl
+    // ✅ CORRECTION 3 : Retourner redirectUrl
     return res.json({
       redirectUrl: gcData.redirect_flows.redirect_url,
       flowId: gcData.redirect_flows.id,
@@ -105,7 +114,7 @@ app.post('/api/coaching/checkout', async (req, res) => {
   }
 });
 
-// Route pour créer un redirect flow GoCardless
+// Route pour créer un redirect flow GoCardless (crédits)
 app.post('/gc/redirect-flow', async (req, res) => {
   try {
     const { sessionToken, amount, description, metadata = {} } = req.body;
@@ -119,17 +128,15 @@ app.post('/gc/redirect-flow', async (req, res) => {
       return res.status(400).json({ error: 'Montant invalide' });
     }
 
-    // Construire le body GoCardless
     const gcBody = {
       redirect_flows: {
         description: String(description),
         session_token: String(sessionToken),
         success_redirect_url: process.env.GC_SUCCESS_REDIRECT_URL || 'https://resilience-backend-production.up.railway.app/gc/success',
-       scheme: 'sepa_core', // IMPORTANT pour UK/EU
+        scheme: 'sepa_core',
       }
     };
 
-    // Ajouter prefilled_customer si on a les infos
     if (metadata.userName || metadata.userEmail) {
       const nameParts = metadata.userName ? String(metadata.userName).trim().split(' ') : ['Client'];
 
@@ -146,18 +153,17 @@ app.post('/gc/redirect-flow', async (req, res) => {
       }
     }
 
-    // Ajouter metadata pour retrouver les infos après paiement
     if (metadata.userId) {
       gcBody.redirect_flows.metadata = {
         user_id: String(metadata.userId),
         credits: String(metadata.credits || '0'),
         amount: String(amountNum),
+        product_type: 'credits',
       };
     }
 
     console.log('[GC] Body envoyé:', JSON.stringify(gcBody, null, 2));
 
-    // Appel GoCardless
     const gcResponse = await fetch(`${process.env.GC_BASE || 'https://api.gocardless.com'}/redirect_flows`, {
       method: 'POST',
       headers: {
@@ -187,7 +193,7 @@ app.post('/gc/redirect-flow', async (req, res) => {
   }
 });
 
-// Route callback GoCardless
+// ✅ Route callback GoCardless - CORRIGÉE
 app.get('/gc/success', async (req, res) => {
   try {
     const { redirect_flow_id, session_token } = req.query;
@@ -226,15 +232,104 @@ app.get('/gc/success', async (req, res) => {
 
     const metadata = flowData.redirect_flows?.metadata || {};
     const userId = metadata.user_id;
-    const credits = parseInt(metadata.credits || '0');
-    const amount = parseFloat(metadata.amount || '0');
+    const productType = metadata.product_type || 'credits';
 
     if (!userId) {
       console.error('[GC] No userId in metadata');
       return res.status(400).send('Missing userId in flow metadata');
     }
 
-    // Enregistrer l'achat
+    const mandateId = flowData.redirect_flows.links.mandate;
+
+    // ✅ GESTION COACHING
+    if (productType === 'coaching') {
+      console.log('[GC] Processing coaching purchase...');
+
+      const programId = parseInt(metadata.program_id);
+      const amountPence = parseInt(metadata.amount_pence || metadata.amount * 100);
+
+      const paymentBody = {
+        payments: {
+          amount: amountPence,
+          currency: 'EUR',
+          links: {
+            mandate: mandateId,
+          },
+          metadata: {
+            user_id: userId,
+            program_id: String(programId),
+            product_type: 'coaching',
+          },
+          description: `Coaching programme ${programId}`,
+        }
+      };
+
+      console.log('[GC] Creating payment...', paymentBody.payments.amount);
+
+      const paymentResponse = await fetch(
+        `${process.env.GC_BASE || 'https://api.gocardless.com'}/payments`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${process.env.GC_ACCESS_TOKEN}`,
+            'GoCardless-Version': '2015-07-06',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(paymentBody),
+        }
+      );
+
+      const paymentData = await paymentResponse.json();
+
+      if (!paymentResponse.ok) {
+        console.error('[GC] Payment creation error:', paymentData);
+        throw new Error('Erreur création paiement');
+      }
+
+      console.log('[GC] Payment created:', paymentData.payments.id);
+
+      await supabase.from('purchases').insert({
+        member_id: userId,
+        product_type: 'coaching_program',
+        quantity: 1,
+        amount_cents: amountPence,
+        status: 'pending',
+        transaction_id: paymentData.payments.id,
+      });
+
+      const { data: prog } = await supabase
+        .from('coaching_programs')
+        .select('sessions')
+        .eq('id', programId)
+        .single();
+
+      const { data: existing } = await supabase
+        .from('coach_enrollments')
+        .select('program_id')
+        .eq('program_id', programId)
+        .eq('member_id', userId)
+        .maybeSingle();
+
+      if (!existing) {
+        await supabase.from('coach_enrollments').insert({
+          program_id: programId,
+          member_id: userId,
+          progress: 0,
+          completed_sessions: 0,
+          total_sessions: parseInt(prog?.sessions) || 0,
+        });
+      }
+
+      console.log('[GC] Coaching enrollment created');
+
+      const appSuccessUrl = process.env.GC_APP_SUCCESS_URL || 'resilienceapp://gc/success';
+      return res.redirect(appSuccessUrl);
+    }
+
+    // ✅ GESTION CRÉDITS
+    const credits = parseInt(metadata.credits || '0');
+    const amount = parseFloat(metadata.amount || '0');
+
     const { error: purchaseError } = await supabase
       .from('credit_purchases')
       .insert({
@@ -252,7 +347,6 @@ app.get('/gc/success', async (req, res) => {
       throw purchaseError;
     }
 
-    // Mettre à jour les crédits
     const { data: currentCredits } = await supabase
       .from('user_credits')
       .select('credits_remaining, total_purchased')
@@ -310,7 +404,15 @@ app.post('/gc/webhook', async (req, res) => {
         const paymentData = await paymentResponse.json();
         console.log('[GC] Payment data:', paymentData);
 
-        if (paymentData.payments?.metadata?.user_id) {
+        const metadata = paymentData.payments?.metadata || {};
+
+        if (metadata.product_type === 'coaching') {
+          await supabase
+            .from('purchases')
+            .update({ status: 'paid' })
+            .eq('transaction_id', paymentId);
+          console.log('[GC] Coaching purchase confirmed:', paymentId);
+        } else if (metadata.user_id) {
           await supabase
             .from('credit_purchases')
             .update({ payment_status: 'completed' })
@@ -323,6 +425,10 @@ app.post('/gc/webhook', async (req, res) => {
         await supabase
           .from('credit_purchases')
           .update({ payment_status: 'failed' })
+          .eq('transaction_id', paymentId);
+        await supabase
+          .from('purchases')
+          .update({ status: 'failed' })
           .eq('transaction_id', paymentId);
         console.log('[GC] Payment failed:', paymentId);
       }
@@ -347,7 +453,7 @@ app.post('/api/webhooks/psp', async (req, res) => {
 
     const { data: prog } = await supabase
       .from('coaching_programs')
-      .select('videos')
+      .select('sessions')
       .eq('id', program_id)
       .single();
 
@@ -361,7 +467,7 @@ app.post('/api/webhooks/psp', async (req, res) => {
     if (!existing) {
       await supabase.from('coach_enrollments').insert({
         program_id, member_id,
-        progress: 0, completed_sessions: 0, total_sessions: prog?.videos || 0
+        progress: 0, completed_sessions: 0, total_sessions: parseInt(prog?.sessions) || 0
       });
     }
 
