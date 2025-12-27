@@ -74,9 +74,7 @@ app.post('/api/coaching/checkout', async (req, res) => {
         metadata: {
           user_id: member_id,
           program_id: String(program_id),
-          amount: String(amount),
-          amount_pence: String(amountPence),  // ✅ En centimes
-          product_type: 'coaching',
+          amount_pence: String(amountPence),  // ✅ En centimes0
         }
       }
     };
@@ -232,7 +230,8 @@ app.get('/gc/success', async (req, res) => {
 
     const metadata = flowData.redirect_flows?.metadata || {};
     const userId = metadata.user_id;
-    const productType = metadata.product_type || 'credits';
+    const programId = metadata.program_id;
+    const productType = programId ? 'coaching' : 'credits';0
 
     if (!userId) {
       console.error('[GC] No userId in metadata');
