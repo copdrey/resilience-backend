@@ -111,7 +111,82 @@ app.post('/api/coaching/checkout', async (req, res) => {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
+// ====================================================================
+// ROUTE : Achat de crédits direct (/api/purchase)
+// À AJOUTER APRÈS la route /api/coaching/checkout (ligne ~117)
+// ====================================================================
+app.post('/api/purchase', async (req, res) => {
+  try {
+    const { member_id, credits, amount } = req.body;
 
+    console.log('[Purchase] Request:', { member_id, credits, amount });
+
+    if (!member_id || !credits || !amount) {
+      return res.status(400).json({ error: 'Missing required fields: member_id, credits, amount' });
+    }
+
+    // Récupérer infos user
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('full_name, email')
+      .eq('id', member_id)
+      .single();
+
+    console.log('[Purchase] User profile:', profile?.email);
+
+    const sessionToken = `purchase_${member_id}_${Date.now()}`;
+    const amountNum = parseFloat(amount);
+
+    const gcBody = {
+      redirect_flows: {
+        description: `Achat ${credits} crédits - Résilience Studio`,
+        session_token: sessionToken,
+        success_redirect_url: process.env.GC_SUCCESS_REDIRECT_URL || 'https://resilience-backend-production.up.railway.app/gc/success',
+        scheme: 'sepa_core',
+        prefilled_customer: {
+          given_name: profile?.full_name?.split(' ')[0] || 'Client',
+          family_name: profile?.full_name?.split(' ').slice(1).join(' ') || '',
+          email: profile?.email || '',
+        },
+        metadata: {
+          user_id: member_id,
+          credits: String(credits),
+          amount: String(amountNum),
+        },
+      }
+    };
+
+    console.log('[Purchase] Creating GoCardless flow...');
+
+    const gcResponse = await fetch(`${process.env.GC_BASE || 'https://api.gocardless.com'}/redirect_flows`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.GC_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(gcBody),
+    });
+
+    const gcData = await gcResponse.json();
+
+    if (!gcResponse.ok) {
+      console.error('[Purchase] GoCardless error:', JSON.stringify(gcData, null, 2));
+      return res.status(500).json({ error: gcData.error?.message || 'Erreur GoCardless' });
+    }
+
+    console.log('[Purchase] Flow created:', gcData.redirect_flows.id);
+
+    return res.json({
+      redirectUrl: gcData.redirect_flows.redirect_url,
+      flowId: gcData.redirect_flows.id,
+    });
+
+  } catch (error) {
+    console.error('[Purchase] Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 // Route pour créer un redirect flow GoCardless (crédits)
 app.post('/gc/redirect-flow', async (req, res) => {
   try {
