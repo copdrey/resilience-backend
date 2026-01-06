@@ -319,8 +319,9 @@ app.post('/courses/:courseId/enroll',
 // ====================================================================
 // ROUTES PUBLIQUES (GoCardless callbacks)
 // ====================================================================
-
+// ✅ REMPLACE LA ROUTE /gc/redirect-flow (lignes 324-398)
 // Route redirect flow GoCardless (garde l'ancienne pour compatibilité)
+
 app.post('/gc/redirect-flow', async (req, res) => {
   try {
     const { sessionToken, amount, description, metadata = {} } = req.body;
@@ -334,31 +335,27 @@ app.post('/gc/redirect-flow', async (req, res) => {
       return res.status(400).json({ error: 'Montant invalide' });
     }
 
+    // ✅ TOUJOURS FOURNIR prefilled_customer (même vide)
+    const nameParts = metadata.userName
+      ? String(metadata.userName).trim().split(' ')
+      : ['Client'];
+
     const gcBody = {
       redirect_flows: {
         description: String(description),
         session_token: String(sessionToken),
         success_redirect_url: process.env.GC_SUCCESS_REDIRECT_URL || 'https://resilience-backend-production.up.railway.app/gc/success',
         scheme: 'sepa_core',
+        // ✅ TOUJOURS PRÉSENT (obligatoire pour GoCardless)
+        prefilled_customer: {
+          given_name: nameParts[0] || 'Client',
+          family_name: nameParts.length > 1 ? nameParts.slice(1).join(' ') : '',
+          email: metadata.userEmail ? String(metadata.userEmail) : '',
+        },
       }
     };
 
-    if (metadata.userName || metadata.userEmail) {
-      const nameParts = metadata.userName ? String(metadata.userName).trim().split(' ') : ['Client'];
-
-      gcBody.redirect_flows.prefilled_customer = {
-        given_name: nameParts[0] || 'Client',
-      };
-
-      if (nameParts.length > 1) {
-        gcBody.redirect_flows.prefilled_customer.family_name = nameParts.slice(1).join(' ');
-      }
-
-      if (metadata.userEmail) {
-        gcBody.redirect_flows.prefilled_customer.email = String(metadata.userEmail);
-      }
-    }
-
+    // ✅ Ajouter metadata si userId présent
     if (metadata.userId) {
       gcBody.redirect_flows.metadata = {
         user_id: String(metadata.userId),
@@ -387,6 +384,8 @@ app.post('/gc/redirect-flow', async (req, res) => {
       return res.status(500).json({ error: data.error?.message || 'Erreur GoCardless' });
     }
 
+    console.log('[GC] Flow créé:', data.redirect_flows.id);
+
     return res.json({
       redirectUrl: data.redirect_flows.redirect_url,
       flowId: data.redirect_flows.id,
@@ -396,6 +395,7 @@ app.post('/gc/redirect-flow', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 
 // Callback GoCardless success
 app.get('/gc/success', async (req, res) => {
