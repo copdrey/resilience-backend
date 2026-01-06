@@ -355,13 +355,13 @@ app.post('/gc/redirect-flow', async (req, res) => {
       }
     };
 
-    // ✅ Ajouter metadata si userId présent
+    // ✅ Ajouter metadata SI userId présent (MAX 3 propriétés !)
     if (metadata.userId) {
       gcBody.redirect_flows.metadata = {
         user_id: String(metadata.userId),
         credits: String(metadata.credits || '0'),
-        amount: String(amountNum),
-        product_type: 'credits',
+        // ❌ SUPPRIMÉ : amount (déjà dans description)
+        // ❌ SUPPRIMÉ : product_type (pas nécessaire)
       };
     }
 
@@ -395,6 +395,7 @@ app.post('/gc/redirect-flow', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 
 
 // Callback GoCardless success
