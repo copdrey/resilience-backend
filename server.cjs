@@ -7,7 +7,7 @@ const { createClient } = require('@supabase/supabase-js');
 const {
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
-  PORT = 8080
+  PORT = 4000
 } = process.env;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -21,396 +21,252 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// ====================================================================
-// MIDDLEWARES DE SÉCURITÉ
-// ====================================================================
+// ✅ Route de santé
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
-// Middleware 1 : Authentification Supabase
-const authenticateUser = async (req, res, next) => {
+// ✅ Route de réservation (V53 compatible)
+app.post('/api/reservations', async (req, res) => {
   try {
-    const authHeader = req.headers.authorization;
+    console.log('[Reservation] Request:', req.body);
 
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Token manquant' });
+    const { course_id, user_id } = req.body;
+
+    if (!course_id || !user_id) {
+      return res.status(400).json({ error: 'course_id et user_id requis' });
     }
 
-    const token = authHeader.split(' ')[1];
-
-    // Vérifier le token avec Supabase
-    const { data: { user }, error } = await supabase.auth.getUser(token);
-
-    if (error || !user) {
-      return res.status(401).json({ error: 'Token invalide' });
-    }
-
-    // Charger le profile
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('*')
-      .eq('id', user.id)
+    // 1. Vérifier que le cours existe
+    const { data: course, error: courseError } = await supabase
+      .from('course_instances')
+      .select('id, capacity, available')
+      .eq('id', course_id)
       .single();
 
-    // Ajouter user et profile à req
-    req.user = user;
-    req.profile = profile;
+    if (courseError || !course) {
+      return res.status(404).json({ error: 'Cours introuvable' });
+    }
 
-    next();
+    if (course.available === false) {
+      return res.status(400).json({ error: 'Ce cours n\'est pas disponible' });
+    }
+
+    // 2. Compter les inscrits
+    const { count: enrolledCount } = await supabase
+      .from('reservations')
+      .select('*', { count: 'exact', head: true })
+      .eq('course_id', course_id)
+      .eq('status', 'confirmed');
+
+    if (enrolledCount >= course.capacity) {
+      return res.status(400).json({ error: 'Cours complet' });
+    }
+
+    // 3. Vérifier que l'utilisateur n'est pas déjà inscrit
+    const { data: existingReservation } = await supabase
+      .from('reservations')
+      .select('id')
+      .eq('course_id', course_id)
+      .eq('user_id', user_id)
+      .eq('status', 'confirmed')
+      .maybeSingle();
+
+    if (existingReservation) {
+      return res.status(400).json({ error: 'Vous êtes déjà inscrit à ce cours' });
+    }
+
+    // 4. Vérifier les crédits (user_credits d'abord, puis users)
+    let credits = 0;
+    const { data: userCredits, error: creditsError } = await supabase
+      .from('user_credits')
+      .select('credits')
+      .eq('user_id', user_id)
+      .maybeSingle();
+
+    if (creditsError || !userCredits) {
+      // Fallback : users.credits
+      const { data: userData } = await supabase
+        .from('users')
+        .select('credits')
+        .eq('id', user_id)
+        .single();
+
+      credits = userData?.credits || 0;
+    } else {
+      credits = userCredits.credits || 0;
+    }
+
+    if (credits < 1) {
+      return res.status(400).json({ error: 'Crédits insuffisants' });
+    }
+
+    // 5. Créer la réservation
+    const { data: reservation, error: reservationError } = await supabase
+      .from('reservations')
+      .insert({
+        user_id: user_id,
+        course_id: parseInt(course_id),
+        status: 'confirmed',
+        reserved_at: new Date().toISOString(),
+      })
+      .select()
+      .single();
+
+    if (reservationError) {
+      console.error('[Reservation] Error creating reservation:', reservationError);
+      throw new Error(reservationError.message);
+    }
+
+    console.log('[Reservation] Created:', reservation.id);
+
+    // 6. Déduire 1 crédit (user_credits d'abord)
+    const { error: updateCreditsError } = await supabase
+      .from('user_credits')
+      .update({
+        credits: credits - 1,
+        updated_at: new Date().toISOString()
+      })
+      .eq('user_id', user_id);
+
+    if (updateCreditsError) {
+      console.warn('[Reservation] user_credits update failed, trying users.credits');
+      // Fallback : users.credits
+      await supabase
+        .from('users')
+        .update({ credits: credits - 1 })
+        .eq('id', user_id);
+    }
+
+    console.log('[Reservation] Credits updated:', credits - 1);
+
+    res.json({
+      success: true,
+      reservation,
+      credits_remaining: credits - 1
+    });
+
+  } catch (error) {
+    console.error('[Reservation] Error:', error);
+    res.status(500).json({ error: error.message || 'Erreur lors de la réservation' });
+  }
+});
+
+// Route pour coaching checkout
+app.post('/api/coaching/checkout', async (req, res) => {
+  try {
+    const { member_id, program_id } = req.body;
+    if (!member_id || !program_id) {
+      return res.status(400).json({ error: 'member_id and program_id are required' });
+    }
+
+    // Récupérer le programme (prix)
+    const { data: prog, error: pe } = await supabase
+      .from('coach_programs')
+      .select('id, price_cents, videos')
+      .eq('id', program_id)
+      .single();
+    if (pe || !prog) return res.status(400).json({ error: pe?.message || 'Program not found' });
+
+    // Créer l'achat
+    const { error: ip } = await supabase.from('purchases').insert({
+      member_id,
+      product_type: 'coaching_program',
+      quantity: 1,
+      amount_cents: prog.price_cents,
+      status: 'paid',
+    });
+    if (ip) return res.status(500).json({ error: ip.message });
+
+    // Créer l'enrôlement si pas déjà présent
+    const { data: existing } = await supabase
+      .from('coach_enrollments')
+      .select('program_id')
+      .eq('program_id', program_id)
+      .eq('member_id', member_id)
+      .maybeSingle();
+
+    if (!existing) {
+      const { error: ie } = await supabase.from('coach_enrollments').insert({
+        program_id,
+        member_id,
+        progress: 0,
+        completed_sessions: 0,
+        total_sessions: prog.videos || 0,
+      });
+      if (ie) return res.status(500).json({ error: ie.message });
+    }
+
+    return res.json({ ok: true });
   } catch (e) {
-    return res.status(500).json({ error: e.message });
+    console.error(e);
+    return res.status(500).json({ error: String(e.message || e) });
   }
-};
+});
 
-// Middleware 2 : Vérifier admin
-const requireAdmin = (req, res, next) => {
-  if (req.profile?.role !== 'admin') {
-    return res.status(403).json({ error: 'Accès refusé - Admin requis' });
-  }
-  next();
-};
-
-// Middleware 3 : Vérifier ownership
-const requireOwnership = (paramName = 'userId') => {
-  return (req, res, next) => {
-    const targetUserId = req.body[paramName] || req.params[paramName];
-
-    // Admin peut tout faire
-    if (req.profile?.role === 'admin') {
-      return next();
-    }
-
-    // Sinon, vérifier que c'est son propre ID
-    if (req.user.id !== targetUserId) {
-      return res.status(403).json({
-        error: 'Accès refusé - Vous ne pouvez agir que sur votre propre compte'
-      });
-    }
-
-    next();
-  };
-};
-
-// ====================================================================
-// ROUTES PROTÉGÉES
-// ====================================================================
-
-// ✅ Checkout coaching - PROTÉGÉ
-app.post('/api/coaching/checkout',
-  authenticateUser,
-  requireOwnership('member_id'),
-  async (req, res) => {
-    try {
-      const { member_id, program_id } = req.body;
-      if (!member_id || !program_id) {
-        return res.status(400).json({ error: 'member_id and program_id are required' });
-      }
-
-      console.log('[Coaching] Checkout request:', { member_id, program_id });
-
-      const { data: prog, error: pe } = await supabase
-        .from('coaching_programs')
-        .select('id, price, title')
-        .eq('id', program_id)
-        .single();
-
-      if (pe || !prog) {
-        console.error('[Coaching] Program not found:', pe);
-        return res.status(400).json({ error: pe?.message || 'Program not found' });
-      }
-
-      console.log('[Coaching] Program found:', prog.title, prog.price);
-
-      const amount = parseFloat(prog.price);
-      const amountPence = Math.round(amount * 100);
-
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('full_name, email')
-        .eq('id', member_id)
-        .single();
-
-      console.log('[Coaching] User profile:', profile?.email);
-
-      const sessionToken = `coaching_${member_id}_${Date.now()}`;
-
-      const gcBody = {
-        redirect_flows: {
-          description: `Coaching ${prog.title}`,
-          session_token: sessionToken,
-          success_redirect_url: process.env.GC_SUCCESS_REDIRECT_URL || 'https://resilience-backend-production.up.railway.app/gc/success',
-          scheme: 'sepa_core',
-          prefilled_customer: {
-            given_name: profile?.full_name?.split(' ')[0] || 'Client',
-            family_name: profile?.full_name?.split(' ').slice(1).join(' ') || '',
-            email: profile?.email || '',
-          },
-          metadata: {
-            user_id: member_id,
-            program_id: String(program_id),
-            amount_pence: String(amountPence),
-          }
-        }
-      };
-
-      console.log('[Coaching] Creating GoCardless flow...');
-
-      const gcResponse = await fetch(`${process.env.GC_BASE || 'https://api.gocardless.com'}/redirect_flows`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${process.env.GC_ACCESS_TOKEN}`,
-          'GoCardless-Version': '2015-07-06',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(gcBody),
-      });
-
-      const gcData = await gcResponse.json();
-
-      if (!gcResponse.ok) {
-        console.error('[Coaching] GoCardless error:', JSON.stringify(gcData, null, 2));
-        return res.status(500).json({ error: gcData.error?.message || 'Erreur GoCardless' });
-      }
-
-      console.log('[Coaching] Flow created:', gcData.redirect_flows.id);
-
-      return res.json({
-        redirectUrl: gcData.redirect_flows.redirect_url,
-        flowId: gcData.redirect_flows.id,
-      });
-
-    } catch (e) {
-      console.error('[Coaching] Error:', e);
-      return res.status(500).json({ error: String(e.message || e) });
-    }
-  }
-);
-
-// ✅ Purchase crédits - PROTÉGÉ
-app.post('/api/purchase',
-  authenticateUser,
-  requireOwnership('member_id'),
-  async (req, res) => {
-    try {
-      const { member_id, credits, amount } = req.body;
-
-      console.log('[Purchase] Request:', { member_id, credits, amount });
-
-      if (!member_id || !credits || !amount) {
-        return res.status(400).json({ error: 'Missing required fields: member_id, credits, amount' });
-      }
-
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('full_name, email')
-        .eq('id', member_id)
-        .single();
-
-      console.log('[Purchase] User profile:', profile?.email);
-
-      const sessionToken = `purchase_${member_id}_${Date.now()}`;
-      const amountNum = parseFloat(amount);
-
-      const gcBody = {
-        redirect_flows: {
-          description: `Achat ${credits} crédits - Résilience Studio`,
-          session_token: sessionToken,
-          success_redirect_url: process.env.GC_SUCCESS_REDIRECT_URL || 'https://resilience-backend-production.up.railway.app/gc/success',
-          scheme: 'sepa_core',
-          prefilled_customer: {
-            given_name: profile?.full_name?.split(' ')[0] || 'Client',
-            family_name: profile?.full_name?.split(' ').slice(1).join(' ') || '',
-            email: profile?.email || '',
-          },
-          metadata: {
-            user_id: member_id,
-            credits: String(credits),
-            amount: String(amountNum),
-          },
-        }
-      };
-
-      console.log('[Purchase] Creating GoCardless flow...');
-
-      const gcResponse = await fetch(`${process.env.GC_BASE || 'https://api.gocardless.com'}/redirect_flows`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${process.env.GC_ACCESS_TOKEN}`,
-          'GoCardless-Version': '2015-07-06',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(gcBody),
-      });
-
-      const gcData = await gcResponse.json();
-
-      if (!gcResponse.ok) {
-        console.error('[Purchase] GoCardless error:', JSON.stringify(gcData, null, 2));
-        return res.status(500).json({ error: gcData.error?.message || 'Erreur GoCardless' });
-      }
-
-      console.log('[Purchase] Flow created:', gcData.redirect_flows.id);
-
-      return res.json({
-        redirectUrl: gcData.redirect_flows.redirect_url,
-        flowId: gcData.redirect_flows.id,
-      });
-
-    } catch (error) {
-      console.error('[Purchase] Error:', error);
-      res.status(500).json({ error: error.message });
-    }
-  }
-);
-
-// ✅ Enroll cours - PROTÉGÉ
-app.post('/courses/:courseId/enroll',
-  authenticateUser,
-  requireOwnership('userId'),
-  async (req, res) => {
-    try {
-      const { courseId } = req.params;
-      const { userId } = req.body;
-
-      if (!userId) {
-        return res.status(400).json({ error: 'userId requis' });
-      }
-
-      const { data: credits, error: creditsError } = await supabase
-        .from('user_credits')
-        .select('credits_remaining')
-        .eq('user_id', userId)
-        .single();
-
-      if (creditsError || !credits || credits.credits_remaining < 1) {
-        return res.status(400).json({ error: 'Crédits insuffisants' });
-      }
-
-      const { data: reservation, error: reservationError } = await supabase
-        .from('reservations')
-        .insert({
-          user_id: userId,
-          course_id: parseInt(courseId),
-          status: 'confirmed',
-          reserved_at: new Date().toISOString(),
-        })
-        .select()
-        .single();
-
-      if (reservationError) throw reservationError;
-
-      const { error: updateError } = await supabase
-        .from('user_credits')
-        .update({ credits_remaining: credits.credits_remaining - 1 })
-        .eq('user_id', userId);
-
-      if (updateError) throw updateError;
-
-      res.json({
-        success: true,
-        reservation,
-        creditsRemaining: credits.credits_remaining - 1
-      });
-    } catch (error) {
-      console.error('[Enroll] Erreur:', error);
-      res.status(500).json({ error: error.message });
-    }
-  }
-);
-
-// ====================================================================
-// ROUTES PUBLIQUES (GoCardless callbacks)
-// ====================================================================
-// ✅ REMPLACE LA ROUTE /gc/redirect-flow (lignes 324-398)
-// Route redirect flow GoCardless (garde l'ancienne pour compatibilité)
-
+// Route pour créer un redirect flow GoCardless (achats de crédits)
 app.post('/gc/redirect-flow', async (req, res) => {
   try {
-    const { sessionToken, amount, description, metadata = {} } = req.body;
+    const { sessionToken, amount, description, metadata } = req.body;
 
     if (!sessionToken || !amount || !description) {
       return res.status(400).json({ error: 'Paramètres manquants' });
     }
 
-    const amountNum = parseFloat(amount);
-    if (isNaN(amountNum) || amountNum <= 0) {
-      return res.status(400).json({ error: 'Montant invalide' });
-    }
-
-    // ✅ TOUJOURS FOURNIR prefilled_customer (même vide)
-    const nameParts = metadata.userName
-      ? String(metadata.userName).trim().split(' ')
-      : ['Client'];
-
-    const gcBody = {
-      redirect_flows: {
-        description: String(description),
-        session_token: String(sessionToken),
-        success_redirect_url: process.env.GC_SUCCESS_REDIRECT_URL || 'https://resilience-backend-production.up.railway.app/gc/success',
-        scheme: 'sepa_core',
-        // ✅ TOUJOURS PRÉSENT (obligatoire pour GoCardless)
-        prefilled_customer: {
-          given_name: nameParts[0] || 'Client',
-          family_name: nameParts.length > 1 ? nameParts.slice(1).join(' ') : '',
-          email: metadata.userEmail ? String(metadata.userEmail) : '',
-        },
-      }
-    };
-
-    // ✅ Ajouter metadata SI userId présent (MAX 3 propriétés !)
-    if (metadata.userId) {
-      gcBody.redirect_flows.metadata = {
-        user_id: String(metadata.userId),
-        credits: String(metadata.credits || '0'),
-        // ❌ SUPPRIMÉ : amount (déjà dans description)
-        // ❌ SUPPRIMÉ : product_type (pas nécessaire)
-      };
-    }
-
-    console.log('[GC] Body envoyé:', JSON.stringify(gcBody, null, 2));
-
-    const gcResponse = await fetch(`${process.env.GC_BASE || 'https://api.gocardless.com'}/redirect_flows`, {
+    // Créer le redirect flow GoCardless
+    const redirectFlow = await fetch(`${process.env.GC_BASE}/redirect_flows`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${process.env.GC_ACCESS_TOKEN}`,
         'GoCardless-Version': '2015-07-06',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(gcBody),
+      body: JSON.stringify({
+        redirect_flows: {
+          description: description,
+          session_token: sessionToken,
+          success_redirect_url: process.env.GC_SUCCESS_REDIRECT_URL || 'http://localhost:4000/gc/success',
+          prefilled_customer: {
+            given_name: metadata?.userName || '',
+            email: metadata?.userEmail || '',
+          },
+          metadata: {
+            ...metadata,
+            amount: amount.toString(),
+          },
+        },
+      }),
     });
 
-    const data = await gcResponse.json();
+    const data = await redirectFlow.json();
 
-    if (!gcResponse.ok) {
-      console.error('[GC] Erreur API:', JSON.stringify(data, null, 2));
-      return res.status(500).json({ error: data.error?.message || 'Erreur GoCardless' });
+    if (!redirectFlow.ok) {
+      throw new Error(data.error?.message || 'Erreur GoCardless');
     }
 
-    console.log('[GC] Flow créé:', data.redirect_flows.id);
-
-    return res.json({
+    res.json({
       redirectUrl: data.redirect_flows.redirect_url,
+      sessionToken,
       flowId: data.redirect_flows.id,
     });
   } catch (error) {
-    console.error('[GC] Erreur:', error);
+    console.error('[GC] Erreur redirect flow:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-
-
-// Callback GoCardless success
+// Route callback GoCardless après paiement
 app.get('/gc/success', async (req, res) => {
   try {
     const { redirect_flow_id } = req.query;
 
     if (!redirect_flow_id) {
-      return res.status(400).send('redirect_flow_id manquant');
+      return res.status(400).send('Missing redirect_flow_id');
     }
 
-    console.log('[GC] Completing flow:', redirect_flow_id);
-
-    const completeResponse = await fetch(
-      `${process.env.GC_BASE || 'https://api.gocardless.com'}/redirect_flows/${redirect_flow_id}/actions/complete`,
+    // Compléter le redirect flow
+    const completeFlow = await fetch(
+      `${process.env.GC_BASE}/redirect_flows/${redirect_flow_id}/actions/complete`,
       {
         method: 'POST',
         headers: {
@@ -418,111 +274,26 @@ app.get('/gc/success', async (req, res) => {
           'GoCardless-Version': '2015-07-06',
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({}),
+        body: JSON.stringify({
+          data: {
+            session_token: req.query.session_token,
+          },
+        }),
       }
     );
 
-    const flowData = await completeResponse.json();
+    const flowData = await completeFlow.json();
 
-    if (!completeResponse.ok) {
-      console.error('[GC] Complete error:', flowData);
-      throw new Error('Erreur complétion flow');
+    if (!completeFlow.ok) {
+      throw new Error('Erreur completion flow');
     }
-
-    console.log('[GC] Flow completed:', flowData.redirect_flows.id);
 
     const metadata = flowData.redirect_flows.metadata || {};
-    const userId = metadata.user_id;
-
-    if (!userId) {
-      console.error('[GC] No user_id in metadata');
-      throw new Error('user_id manquant');
-    }
-
-    // Coaching
-    if (metadata.program_id) {
-      const programId = metadata.program_id;
-      const amountPence = parseInt(metadata.amount_pence || '0');
-
-      const paymentBody = {
-        payments: {
-          amount: amountPence,
-          currency: 'EUR',
-          links: {
-            mandate: flowData.redirect_flows.links.mandate,
-          },
-          metadata: {
-            user_id: userId,
-            program_id: programId,
-            product_type: 'coaching',
-          },
-        },
-      };
-
-      const paymentResponse = await fetch(
-        `${process.env.GC_BASE || 'https://api.gocardless.com'}/payments`,
-        {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${process.env.GC_ACCESS_TOKEN}`,
-            'GoCardless-Version': '2015-07-06',
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(paymentBody),
-        }
-      );
-
-      const paymentData = await paymentResponse.json();
-
-      if (!paymentResponse.ok) {
-        console.error('[GC] Payment creation error:', paymentData);
-        throw new Error('Erreur création paiement');
-      }
-
-      console.log('[GC] Payment created:', paymentData.payments.id);
-
-      await supabase.from('purchases').insert({
-        member_id: userId,
-        product_type: 'coaching_program',
-        quantity: 1,
-        amount_cents: amountPence,
-        status: 'pending',
-        transaction_id: paymentData.payments.id,
-      });
-
-      const { data: prog } = await supabase
-        .from('coaching_programs')
-        .select('sessions')
-        .eq('id', programId)
-        .single();
-
-      const { data: existing } = await supabase
-        .from('coach_enrollments')
-        .select('program_id')
-        .eq('program_id', programId)
-        .eq('member_id', userId)
-        .maybeSingle();
-
-      if (!existing) {
-        await supabase.from('coach_enrollments').insert({
-          program_id: programId,
-          member_id: userId,
-          progress: 0,
-          completed_sessions: 0,
-          total_sessions: parseInt(prog?.sessions) || 0,
-        });
-      }
-
-      console.log('[GC] Coaching enrollment created');
-
-      const appSuccessUrl = process.env.GC_APP_SUCCESS_URL || 'resilienceapp://gc/success';
-      return res.redirect(appSuccessUrl);
-    }
-
-    // Crédits
+    const userId = metadata.userId;
     const credits = parseInt(metadata.credits || '0');
     const amount = parseFloat(metadata.amount || '0');
 
+    // Enregistrer l'achat dans credit_purchases
     const { error: purchaseError } = await supabase
       .from('credit_purchases')
       .insert({
@@ -532,17 +303,14 @@ app.get('/gc/success', async (req, res) => {
         payment_status: 'completed',
         payment_method: 'gocardless',
         transaction_id: flowData.redirect_flows.id,
-        notes: `GoCardless payment - ${credits} crédits`,
       });
 
-    if (purchaseError) {
-      console.error('[GC] Error creating purchase:', purchaseError);
-      throw purchaseError;
-    }
+    if (purchaseError) throw purchaseError;
 
+    // Mettre à jour les crédits de l'utilisateur
     const { data: currentCredits } = await supabase
       .from('user_credits')
-      .select('credits_remaining, total_purchased')
+      .select('credits')
       .eq('user_id', userId)
       .maybeSingle();
 
@@ -550,87 +318,29 @@ app.get('/gc/success', async (req, res) => {
       await supabase
         .from('user_credits')
         .update({
-          credits_remaining: (currentCredits.credits_remaining || 0) + credits,
-          total_purchased: (currentCredits.total_purchased || 0) + credits,
+          credits: (currentCredits.credits || 0) + credits,
+          updated_at: new Date().toISOString()
         })
         .eq('user_id', userId);
     } else {
       await supabase.from('user_credits').insert({
         user_id: userId,
-        credits_remaining: credits,
-        total_purchased: credits,
+        credits: credits,
       });
     }
 
-    console.log('[GC] Credits updated for user:', userId);
+    // Aussi mettre à jour users.credits pour compatibilité
+    await supabase
+      .from('users')
+      .update({ credits: supabase.rpc('increment_credits', { user_id: userId, amount: credits }) })
+      .eq('id', userId);
 
+    // Rediriger vers l'app avec deep link
     const appSuccessUrl = process.env.GC_APP_SUCCESS_URL || 'resilienceapp://gc/success';
     res.redirect(appSuccessUrl);
   } catch (error) {
     console.error('[GC] Erreur callback:', error);
-    res.status(500).send('Erreur lors du paiement: ' + error.message);
-  }
-});
-
-// Webhook GoCardless
-app.post('/gc/webhook', async (req, res) => {
-  try {
-    const events = req.body.events || [];
-    console.log('[GC] Webhook received:', events.length, 'events');
-
-    for (const event of events) {
-      console.log('[GC] Processing event:', event.resource_type, event.action);
-
-      if (event.resource_type === 'payments' && event.action === 'confirmed') {
-        const paymentId = event.links.payment;
-
-        const paymentResponse = await fetch(
-          `${process.env.GC_BASE || 'https://api.gocardless.com'}/payments/${paymentId}`,
-          {
-            headers: {
-              'Authorization': `Bearer ${process.env.GC_ACCESS_TOKEN}`,
-              'GoCardless-Version': '2015-07-06',
-            },
-          }
-        );
-
-        const paymentData = await paymentResponse.json();
-        console.log('[GC] Payment data:', paymentData);
-
-        const metadata = paymentData.payments?.metadata || {};
-
-        if (metadata.product_type === 'coaching') {
-          await supabase
-            .from('purchases')
-            .update({ status: 'paid' })
-            .eq('transaction_id', paymentId);
-          console.log('[GC] Coaching purchase confirmed:', paymentId);
-        } else if (metadata.user_id) {
-          await supabase
-            .from('credit_purchases')
-            .update({ payment_status: 'completed' })
-            .eq('transaction_id', paymentId);
-        }
-      }
-
-      if (event.resource_type === 'payments' && event.action === 'failed') {
-        const paymentId = event.links.payment;
-        await supabase
-          .from('credit_purchases')
-          .update({ payment_status: 'failed' })
-          .eq('transaction_id', paymentId);
-        await supabase
-          .from('purchases')
-          .update({ status: 'failed' })
-          .eq('transaction_id', paymentId);
-        console.log('[GC] Payment failed:', paymentId);
-      }
-    }
-
-    res.status(200).json({ received: true });
-  } catch (error) {
-    console.error('[GC] Webhook error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).send('Erreur lors du paiement');
   }
 });
 
@@ -638,6 +348,7 @@ app.post('/gc/webhook', async (req, res) => {
 app.post('/api/webhooks/psp', async (req, res) => {
   try {
     const { member_id, program_id, amount_cents, status } = req.body;
+
     if (status !== 'paid') return res.json({ ok: true });
 
     await supabase.from('purchases').insert({
@@ -645,8 +356,8 @@ app.post('/api/webhooks/psp', async (req, res) => {
     });
 
     const { data: prog } = await supabase
-      .from('coaching_programs')
-      .select('sessions')
+      .from('coach_programs')
+      .select('videos')
       .eq('id', program_id)
       .single();
 
@@ -660,7 +371,7 @@ app.post('/api/webhooks/psp', async (req, res) => {
     if (!existing) {
       await supabase.from('coach_enrollments').insert({
         program_id, member_id,
-        progress: 0, completed_sessions: 0, total_sessions: parseInt(prog?.sessions) || 0
+        progress: 0, completed_sessions: 0, total_sessions: prog?.videos || 0
       });
     }
 
@@ -671,57 +382,13 @@ app.post('/api/webhooks/psp', async (req, res) => {
   }
 });
 
-// ====================================================================
-// ROUTES ADMIN (PROTÉGÉES)
-// ====================================================================
-
-// Debug Supabase - ADMIN SEULEMENT
-app.get('/debug/supabase',
-  authenticateUser,
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const { count: userCount, error: userError } = await supabase
-        .from('profiles')
-        .select('*', { count: 'exact', head: true });
-
-      if (userError) throw userError;
-
-      const { count: courseCount, error: courseError } = await supabase
-        .from('course_templates')
-        .select('*', { count: 'exact', head: true });
-
-      if (courseError) throw courseError;
-
-      const { count: paymentCount, error: paymentError} = await supabase
-        .from('credit_purchases')
-        .select('*', { count: 'exact', head: true });
-
-      if (paymentError) throw paymentError;
-
-      res.json({
-        status: 'ok',
-        supabase: 'connected',
-        counts: {
-          users: userCount,
-          courses: courseCount,
-          payments: paymentCount,
-        },
-        timestamp: new Date().toISOString(),
-      });
-    } catch (error) {
-      res.status(500).json({
-        status: 'error',
-        error: error.message,
-        timestamp: new Date().toISOString(),
-      });
-    }
-  }
-);
-
-// Health check - PUBLIC
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Backend listening on :${PORT}`);
+  console.log(`✅ Routes disponibles:`);
+  console.log(`   GET  /api/health`);
+  console.log(`   POST /api/reservations`);
+  console.log(`   POST /api/coaching/checkout`);
+  console.log(`   POST /gc/redirect-flow`);
+  console.log(`   GET  /gc/success`);
+  console.log(`   POST /api/webhooks/psp`);
 });
-
-app.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend SECURED listening on :${PORT}`));
