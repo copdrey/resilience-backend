@@ -114,7 +114,29 @@ app.post('/courses/:courseId/enroll', async (req, res) => {
       return res.status(400).json({ error: 'Course is full' });
     }
 
-    // 3. Créer la réservation
+    // 3. Vérifier si l'utilisateur a déjà réservé ce cours
+    const { data: existingReservation, error: existingError } = await supabase
+      .from('reservations')
+      .select('id, status')
+      .eq('user_id', userId)
+      .eq('course_id', courseId)
+      .maybeSingle();
+
+    if (existingError) {
+      console.error('[ENROLL] Error checking existing reservation:', existingError);
+      return res.status(500).json({ error: 'Failed to check existing reservation' });
+    }
+
+    if (existingReservation) {
+      console.log('[ENROLL] User already has a reservation:', existingReservation);
+      return res.status(400).json({
+        error: 'Already reserved',
+        message: 'Vous avez déjà réservé ce cours',
+        reservation: existingReservation
+      });
+    }
+
+    // 4. Créer la réservation
     const { data: reservation, error: reservationError } = await supabase
       .from('reservations')
       .insert({
@@ -131,7 +153,7 @@ app.post('/courses/:courseId/enroll', async (req, res) => {
       return res.status(500).json({ error: 'Failed to create reservation' });
     }
 
-    // 4. Déduire 1 crédit
+    // 5. Déduire 1 crédit
     const { error: deductError } = await supabase
       .from('user_credits')
       .update({ credits_remaining: userCredits.credits_remaining - 1 })
