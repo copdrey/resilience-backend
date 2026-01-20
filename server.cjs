@@ -8,6 +8,11 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// ✅ MIDDLEWARES CRITIQUES (AJOUTÉS)
+app.use(cors());
+app.use(express.json()); // ← FIX: Parse le body JSON
+app.use(express.urlencoded({ extended: true }));
+
 // ✅ VÉRIFICATION APRÈS CHARGEMENT
 console.log('🚀 Starting Resilience Backend...');
 console.log('📍 Environment:', process.env.NODE_ENV || 'development');
@@ -55,7 +60,9 @@ app.post('/gc/redirect-flow', async (req, res) => {
     if (!metadata?.userId) throw new Error('metadata.userId required');
 
     // URL de succès
-    const baseUrl = process.env.RAILWAY_PUBLIC_DOMAIN || 'https://resilience-backend-production.up.railway.app';
+    const baseUrl = process.env.RAILWAY_PUBLIC_DOMAIN
+      ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+      : 'https://resilience-backend-production.up.railway.app';
     const successUrl = `${baseUrl}/gc/success?user=${metadata.userId}&credits=${metadata.credits || 0}&session=${sessionToken}`;
 
     console.log('[GC] Success URL:', successUrl);
